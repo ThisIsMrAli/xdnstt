@@ -189,11 +189,23 @@ info "Current commit: $(git -C "$REPO_DIR" log --oneline -1)"
 # ── 4. Compile dnstt-server ────────────────────────────────────────────────────
 DNSTT_SERVER_BIN="${INSTALL_DIR}/dnstt-server"
 
+# Rebuild automatically when the repo commit changes.
+BUILD_STAMP_FILE="${CONFIG_DIR}/build.commit"
+
 needs_build=false
 if [[ ! -x "$DNSTT_SERVER_BIN" ]]; then
   needs_build=true
 elif [[ "$REBUILD" == "true" ]]; then
   needs_build=true
+else
+  current_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  last_commit=""
+  if [[ -s "$BUILD_STAMP_FILE" ]]; then
+    last_commit="$(cat "$BUILD_STAMP_FILE" 2>/dev/null || true)"
+  fi
+  if [[ "$current_commit" != "$last_commit" ]]; then
+    needs_build=true
+  fi
 fi
 
 if [[ "$needs_build" == "true" ]]; then
@@ -201,9 +213,12 @@ if [[ "$needs_build" == "true" ]]; then
   cd "$REPO_DIR"
   go build -o "${DNSTT_SERVER_BIN}" ./dnstt-server/
   chmod 0755 "$DNSTT_SERVER_BIN"
+  mkdir -p "$CONFIG_DIR"
+  echo "$(git -C "$REPO_DIR" rev-parse HEAD)" > "$BUILD_STAMP_FILE"
+  chmod 0644 "$BUILD_STAMP_FILE"
   info "Binary: ${DNSTT_SERVER_BIN}"
 else
-  info "Binary already exists (use --rebuild to recompile)"
+  info "Binary up to date (use --rebuild to force recompile)"
 fi
 info "Version check: $("$DNSTT_SERVER_BIN" -gen-key 2>&1 | head -1 || true)"
 

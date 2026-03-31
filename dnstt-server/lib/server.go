@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,20 @@ const (
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// isShutdownError reports whether err is an expected error produced when the
+// server is shutting down gracefully (closed connections/pipes). These are
+// suppressed from logs to keep shutdown output clean.
+func isShutdownError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "use of closed") ||
+		strings.Contains(s, "closed network connection") ||
+		strings.Contains(s, "closed pipe") ||
+		strings.Contains(s, "io: read/write on closed pipe")
+}
 
 // randomTTL returns a TTL ±20% around ResponseTTL to prevent fingerprinting
 // on fixed TTL values.
@@ -710,7 +725,11 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	go func() {
 		err := acceptSessions(ln, privkey, mtu, upstream, &clientPayloadLimit)
 		if err != nil {
-			log.Printf("acceptSessions: %v", err)
+			// "io: read/write on closed pipe" is expected on graceful shutdown
+			// when the KCP listener is closed. Suppress it.
+			if !isShutdownError(err) {
+				log.Printf("acceptSessions: %v", err)
+			}
 		}
 	}()
 
@@ -720,7 +739,9 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	go func() {
 		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, maxUDPPayload, hooks)
 		if err != nil {
-			log.Printf("sendLoop: %v", err)
+			if !isShutdownError(err) {
+				log.Printf("sendLoop: %v", err)
+			}
 		}
 	}()
 

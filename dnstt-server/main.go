@@ -38,12 +38,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -270,17 +272,34 @@ Example:
 
 		log.Printf("listening on %s", listenAddr)
 
+		errCh := make(chan error, 1)
 		go func() {
-			err := serverlib.Run(privkey, domain, upstream, dnsConn, maxUDPPayload, nil)
-			if err != nil {
-				log.Fatal(err)
-			}
+			errCh <- serverlib.Run(privkey, domain, upstream, dnsConn, maxUDPPayload, nil)
 		}()
 
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
-		sig := <-sigChan
-		log.Printf("caught signal %q, exiting", sig)
+		select {
+		case sig := <-sigChan:
+			log.Printf("caught signal %q, exiting", sig)
+			_ = dnsConn.Close()
+			err := <-errCh
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) ||
+					strings.Contains(err.Error(), "use of closed") ||
+					strings.Contains(err.Error(), "closed network connection") {
+					os.Exit(0)
+				}
+				log.Printf("server error during shutdown: %v", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case err := <-errCh:
+			if err != nil {
+				log.Printf("server error: %v", err)
+				os.Exit(1)
+			}
+		}
 	}
 }

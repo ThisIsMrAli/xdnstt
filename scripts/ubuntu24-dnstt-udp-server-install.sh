@@ -335,6 +335,8 @@ After=network-online.target
 Wants=network-online.target
 # Restart after Dante too if it's installed
 After=danted.service
+StartLimitIntervalSec=60
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -353,8 +355,6 @@ ExecStart=${DNSTT_SERVER_BIN} \\
 # immediately. After 30 crashes within 60s it will slow down to 1/30s pace.
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=30
 
 # Allow large numbers of concurrent DNS sessions
 LimitNOFILE=1048576

@@ -22,6 +22,7 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
+	dnsttv2 "www.bamsoftware.com/git/dnstt.git/dnstt-v2"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
@@ -426,7 +427,8 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, 
 }
 
 // recvLoop extracts packets from incoming DNS queries.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, maxUDPPayload int, hooks *ServerHooks, clientPayloadLimit *sync.Map) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, maxUDPPayload int, hooks *ServerHooks, clientPayloadLimit *sync.Map, clientMode *sync.Map, v2Dec *sync.Map) error {
+
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -453,13 +455,34 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			clientPayloadLimit.Store(clientID.String(), limit)
 		}
 		if n == len(clientID) {
+			modeAny, _ := clientMode.Load(clientID.String())
+			mode, _ := modeAny.(string)
+			// Default until proven otherwise.
+			if mode == "" {
+				mode = "v1"
+			}
+
 			r := bytes.NewReader(payload)
 			for {
 				p, err := nextPacket(r)
 				if err != nil {
 					break
 				}
-				ttConn.QueueIncoming(p, clientID)
+				// If we haven't classified this client yet, look for a v2 packet marker.
+				if mode == "v1" && dnsttv2.IsV2Packet(p) {
+					mode = "v2"
+					clientMode.Store(clientID.String(), "v2")
+				}
+				if mode == "v2" {
+					// v2 packets carry KCP datagrams inside their payload (with optional XOR-FEC).
+					v, _ := v2Dec.LoadOrStore(clientID.String(), dnsttv2.NewFECDecoder(binary.BigEndian.Uint32(clientID[0:4])))
+					dec := v.(*dnsttv2.FECDecoder)
+					for _, inner := range dec.ConsumeV2Packet(p) {
+						ttConn.QueueIncoming(inner, clientID)
+					}
+				} else {
+					ttConn.QueueIncoming(p, clientID)
+				}
 			}
 		} else {
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
@@ -477,7 +500,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 
 // sendLoop sends DNS responses, packing downstream data into TXT or A answers.
 
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, maxUDPPayload int, hooks *ServerHooks) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, maxUDPPayload int, hooks *ServerHooks, clientMode *sync.Map, v2Enc *sync.Map) error {
 	// Cache ComputeMaxEncodedPayload(limit) per payload limit.
 	type cached struct {
 		maxEncoded int
@@ -570,8 +593,25 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					if int(uint16(len(p))) != len(p) {
 						panic(len(p))
 					}
-					_ = binary.Write(&payload, binary.BigEndian, uint16(len(p)))
-					payload.Write(p)
+					// For v2 clients, wrap outgoing KCP datagrams into v2 packets (and
+					// occasionally append XOR-FEC parity packets) before embedding into
+					// the DNS response payload.
+					modeAny, _ := clientMode.Load(rec.ClientID.String())
+					mode, _ := modeAny.(string)
+					if mode == "v2" {
+						v, _ := v2Enc.LoadOrStore(rec.ClientID.String(), dnsttv2.NewFECEncoder(binary.BigEndian.Uint32(rec.ClientID[0:4]), 6))
+						enc := v.(*dnsttv2.FECEncoder)
+						dataPkt, fecPkt := enc.WrapData(p)
+						_ = binary.Write(&payload, binary.BigEndian, uint16(len(dataPkt)))
+						payload.Write(dataPkt)
+						if fecPkt != nil {
+							_ = binary.Write(&payload, binary.BigEndian, uint16(len(fecPkt)))
+							payload.Write(fecPkt)
+						}
+					} else {
+						_ = binary.Write(&payload, binary.BigEndian, uint16(len(p)))
+						payload.Write(p)
+					}
 				}
 				timer.Stop()
 
@@ -713,6 +753,11 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	// Tracks the most recent EDNS0 UDP payload limit seen per client ID,
 	// to clamp KCP MTU per client for 512-limited paths.
 	var clientPayloadLimit sync.Map // map[string]int
+	// Tracks whether a client speaks v1 or v2.
+	var clientMode sync.Map // map[string]string
+	// v2 encoder/decoder state per client.
+	var v2Enc sync.Map // map[string]*dnsttv2.FECEncoder
+	var v2Dec sync.Map // map[string]*dnsttv2.FECDecoder
 
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, IdleTimeout*2)
 	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
@@ -737,7 +782,7 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	defer close(ch)
 
 	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, maxUDPPayload, hooks)
+		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, maxUDPPayload, hooks, &clientMode, &v2Enc)
 		if err != nil {
 			if !isShutdownError(err) {
 				log.Printf("sendLoop: %v", err)
@@ -745,5 +790,5 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, maxUDPPayload, hooks, &clientPayloadLimit)
+	return recvLoop(domain, dnsConn, ttConn, ch, maxUDPPayload, hooks, &clientPayloadLimit, &clientMode, &v2Dec)
 }

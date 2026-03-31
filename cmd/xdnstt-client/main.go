@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
+	dnsttv2 "www.bamsoftware.com/git/dnstt.git/dnstt-v2"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 
 	dc "www.bamsoftware.com/git/dnstt.git/dnstt-client/lib"
@@ -29,6 +31,8 @@ func main() {
 		domainStr    string
 		domainsStr   string
 		pubkeyHex    string
+		v2           bool
+		v2fec        int
 
 		edns0         int
 		probeEDNS0    bool
@@ -47,6 +51,8 @@ func main() {
 	flag.StringVar(&domainStr, "domain", "", "tunnel domain (e.g. t.example.com)")
 	flag.StringVar(&domainsStr, "domains", "", "comma-separated domain list (random per session); overrides -domain when set")
 	flag.StringVar(&pubkeyHex, "pubkey", "", "server public key hex (64 hex digits)")
+	flag.BoolVar(&v2, "v2", false, "enable experimental v2 packet wrapper (dual-stack server required)")
+	flag.IntVar(&v2fec, "v2fec", 6, "v2 XOR-FEC group size (0 disables, default 6)")
 
 	flag.IntVar(&edns0, "edns0", 512, "starting EDNS0 UDP payload size to advertise (UDP default 512; probing promotes automatically)")
 	flag.BoolVar(&probeEDNS0, "probeedns0", true, "enable automatic EDNS0 probing (promotes to 1232/4096 when path supports it)")
@@ -167,7 +173,15 @@ func main() {
 			PollJitter:    jitter,
 			BurstMode:     burst && jitter,
 		}
-		pconn = dc.NewDNSPacketConnWithConfig(upc, remoteAddr, domain, dnsCfg)
+		dnsConn := dc.NewDNSPacketConnWithConfig(upc, remoteAddr, domain, dnsCfg)
+		pconn = dnsConn
+		if v2 {
+			// Wrap the DNS packet conn with v2 FEC wrapper so KCP sees original
+			// datagrams, while DNS carries v2 packets.
+			cid := dnsConn.ClientID()
+			connID := binary.BigEndian.Uint32(cid[:4])
+			pconn = dnsttv2.NewPacketConn(dnsConn, remoteAddr, connID, v2fec)
+		}
 
 		// KCP on top.
 		kconn, err = kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)

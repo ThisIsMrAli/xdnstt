@@ -30,7 +30,7 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/dnstt}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_NAME="${SERVICE_NAME:-dnstt-udp}"
 SERVICE_USER="${SERVICE_USER:-dnstt}"
-MTU_DEFAULT="${MTU_DEFAULT:-1232}"
+MTU_DEFAULT="${MTU_DEFAULT:-500}"
 GO_VERSION_REQUIRED="1.24"
 GO_VERSION_INSTALL="1.24.2"               # patch version to install when missing
 GO_INSTALL_DIR="/usr/local/go"
@@ -58,8 +58,9 @@ ${BOLD}Upstream (pick one):${NC}
   --upstream <ip:port>       Forward streams to an existing service (e.g. 127.0.0.1:1080)
 
 ${BOLD}Optional:${NC}
-  --mtu <n>                  Server max UDP payload in bytes (default 1232)
+  --mtu <n>                  Server max UDP payload in bytes (default 500)
                              Client starts at 512 and auto-probes upward — you rarely need to change this.
+
   --port <n>                 Local UDP port dnstt-server listens on (default 5300)
                              Port 53 is redirected here automatically.
   --no-redirect              Skip iptables redirect (use this only if you run directly on port 53)

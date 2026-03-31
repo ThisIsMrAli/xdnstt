@@ -1,0 +1,842 @@
+package dnstt_client
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+// edns0ProbeSteps is the ladder of EDNS0 sizes tried during adaptive probing.
+// We start at 512 (universally safe) and probe upward when the observed
+// response sizes suggest the path can handle larger UDP payloads.
+var edns0ProbeSteps = []uint32{512, 768, 1024, 1232, 4096}
+
+// largestResponseProvider is implemented by transports that can report the
+// maximum DNS response size they have observed (used for EDNS0 probing).
+type largestResponseProvider interface {
+	LargestResponse() int
+}
+
+const (
+	// numPadding How many bytes of random padding to insert into data queries.
+	// Data payloads already vary, so no extra padding is needed for cache busting.
+	numPadding = 0
+	// pollPaddingMin / pollPaddingMax define the random range of padding bytes
+	// inserted into otherwise-empty polling queries. Using a range (instead of a
+	// fixed 8) means every poll has a different encoded QNAME length, breaking the
+	// fixed-size fingerprint that DPI systems use to detect tunnel polling.
+	// Must stay ≤ 31 (prefix codes start at 224 = 0xe0, padding prefix = 224+n).
+	pollPaddingMin = 4
+	pollPaddingMax = 12
+
+	// NumPadding is the exported version of numPadding for use by external modules.
+	NumPadding = numPadding
+	// NumPaddingForPoll is the exported version for external modules (kept for
+	// compatibility; the actual value per query is now randomised).
+	NumPaddingForPoll = pollPaddingMin
+
+	// sendLoop has a poll timer that automatically sends an empty polling
+	// query when a certain amount of time has elapsed without a send. The
+	// poll timer is initially set to initPollDelay. It increases by a
+	// factor of pollDelayMultiplier every time the poll timer expires, up
+	// to a maximum of maxPollDelay. The poll timer is reset to
+	// initPollDelay whenever an a send occurs that is not the result of the
+	// poll timer expiring.
+	initPollDelay       = 1 * time.Second
+	maxPollDelay        = 10 * time.Second
+	pollDelayMultiplier = 2.0
+
+	// A limit on the number of empty poll requests we may send in a burst
+	// as a result of receiving data.
+	pollLimit = 10
+)
+
+// SendFunc is the type for custom send functions that can replace the default
+// base32 send behavior. It receives the transport, payload bytes, and address.
+type SendFunc func(transport net.PacketConn, p []byte, addr net.Addr) error
+
+// DNSPacketConnHooks allows external modules to plug custom behavior into
+// DNSPacketConn without modifying the core send loop.
+type DNSPacketConnHooks struct {
+	// CustomSendFunc, if non-nil, replaces the default send() in sendLoop.
+	CustomSendFunc SendFunc
+	// PreSendHook, if non-nil, is called before each send in sendLoop
+	// (e.g., for adding jitter).
+	PreSendHook func()
+	// OnStart, if non-nil, is called once when sendLoop begins
+	// (e.g., to start cover traffic goroutines).
+	OnStart func(transport net.PacketConn, addr net.Addr)
+	// ClientID, if non-nil, overrides the randomly generated ClientID.
+	// This allows the caller to share the ClientID with the custom send function.
+	ClientID *turbotunnel.ClientID
+}
+
+// DNSPacketConnConfig holds optional configuration for NewDNSPacketConnWithConfig.
+type DNSPacketConnConfig struct {
+	// PollLimit overrides the default pollLimit (burst limit for empty poll
+	// requests after receiving data). Zero means use the package default.
+	PollLimit int
+	// InitPollDelay overrides the initial poll timer delay.
+	// Zero means use the package default (500ms).
+	InitPollDelay time.Duration
+	// MaxPollDelay overrides the maximum poll timer delay.
+	// Zero means use the package default (10s).
+	MaxPollDelay time.Duration
+	// EDNS0Size overrides the EDNS(0) UDP payload size advertised in queries.
+	// This tells the server the maximum DNS response size this client accepts.
+	// Zero means use the default (4096). Common values: 1232 (RFC 8020),
+	// 4096 (maximum throughput).
+	EDNS0Size int
+	// PollJitter adds ±30% random variation to poll timer intervals.
+	// This breaks the deterministic exponential backoff pattern that
+	// DPI can fingerprint. Default is false (upstream dnstt behavior).
+	PollJitter bool
+	// BurstMode shapes idle polling to mimic real browsing DNS patterns.
+	// Instead of exponential backoff, idle polls are sent in small bursts
+	// (2-5 queries ~80ms apart) separated by longer silences (2-8s),
+	// resembling page-load → reading → page-load cycles.
+	// Requires PollJitter to be true. Default is false.
+	BurstMode bool
+	// ProbeEDNS0 enables adaptive EDNS0 probing. The client starts with a
+	// conservative EDNS0 payload size (EDNS0Size, or 512 if unset) and
+	// automatically promotes it when the transport reports that larger
+	// DNS responses are being delivered successfully. This lets 512-limited
+	// paths stay stable while naturally upgrading to 1232 or 4096 when the
+	// network allows it.
+	ProbeEDNS0 bool
+	// CoverQueries causes roughly 15% of idle poll queries to be sent as
+	// DNS type A (or AAAA) instead of TXT. The server still decodes the
+	// encoded QNAME correctly and routes any upstream KCP data, but returns
+	// an empty non-TXT response. This breaks the "100% TXT queries" traffic
+	// fingerprint that DPI systems use to identify DNS tunnels.
+	// Only applied to poll (empty) queries, never to data-carrying ones.
+	CoverQueries bool
+}
+
+// base32Encoding is a base32 encoding without padding.
+var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// DNSPacketConn provides a packet-sending and -receiving interface over various
+// forms of DNS. It handles the details of how packets and padding are encoded
+// as a DNS name in the Question section of an upstream query, and as a TXT RR
+// in downstream responses.
+//
+// DNSPacketConn does not handle the mechanics of actually sending and receiving
+// encoded DNS messages. That is rather the responsibility of some other
+// net.PacketConn such as net.UDPConn, HTTPPacketConn, or TLSPacketConn, one of
+// which must be provided to NewDNSPacketConn.
+//
+// We don't have a need to match up a query and a response by ID. Queries and
+// responses are vehicles for carrying data and for our purposes don't need to
+// be correlated. When sending a query, we generate a random ID, and when
+// receiving a response, we ignore the ID.
+type DNSPacketConn struct {
+	clientID turbotunnel.ClientID
+	domain   dns.Name
+	// Sending on pollChan permits sendLoop to send an empty polling query.
+	// sendLoop also does its own polling according to a time schedule.
+	pollChan chan struct{}
+	// Configurable poll timing (zero means use package defaults).
+	cfgInitPollDelay time.Duration
+	cfgMaxPollDelay  time.Duration
+	// edns0Size is the EDNS(0) UDP payload size to advertise. 0 = 4096.
+	edns0Size int
+	// pollJitter enables ±30% random variation on poll timer intervals.
+	pollJitter bool
+	// burstMode shapes idle polls into bursts separated by silences.
+	burstMode bool
+
+	// hooks holds optional pluggable behavior for sendLoop.
+	hooks *DNSPacketConnHooks
+
+	// Adaptive EDNS0 probing fields (all zero-safe).
+	probeEDNS0   bool          // enabled when ProbeEDNS0 is set in config
+	currentEDNS0 atomic.Uint32 // current effective EDNS0 payload size
+	largestResp  atomic.Uint32 // largest DNS response observed (bytes)
+	sendCount    atomic.Uint64 // total queries sent (for probe scheduling)
+
+	// coverQueries mixes A/AAAA queries into the idle poll stream.
+	coverQueries bool
+
+	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
+	// recvLoop and sendLoop take the messages out of the receive and send
+	// queues and actually put them on the network.
+	*turbotunnel.QueuePacketConn
+}
+
+// edns0Class returns the EDNS(0) UDP payload size to advertise in this query.
+// When probing is enabled it returns the current adaptive value; otherwise it
+// returns the configured static value (defaulting to 4096).
+func (c *DNSPacketConn) edns0Class() uint16 {
+	if c.probeEDNS0 {
+		if v := c.currentEDNS0.Load(); v > 0 {
+			return uint16(v)
+		}
+		return 512
+	}
+	if c.edns0Size > 0 {
+		return uint16(c.edns0Size)
+	}
+	return 4096
+}
+
+// tryPromoteEDNS0 examines the largest DNS response observed by the transport
+// and, if the path appears to handle more than the current EDNS0 limit,
+// advances currentEDNS0 to the next step in edns0ProbeSteps.
+func (c *DNSPacketConn) tryPromoteEDNS0(transport net.PacketConn) {
+	cur := c.currentEDNS0.Load()
+	if cur == 0 {
+		cur = 512
+		c.currentEDNS0.Store(cur)
+	}
+
+	// Find next probe step above current.
+	var nextStep uint32
+	for _, step := range edns0ProbeSteps {
+		if step > cur {
+			nextStep = step
+			break
+		}
+	}
+	if nextStep == 0 {
+		return // already at maximum
+	}
+
+	// Prefer the transport's reported value (UDPQueryPacketConn) which is
+	// more accurate; fall back to our internal counter from recvLoop.
+	largest := c.largestResp.Load()
+	if lrp, ok := transport.(largestResponseProvider); ok {
+		if l := uint32(lrp.LargestResponse()); l > largest {
+			largest = l
+		}
+	}
+
+	// Promote when observed response size exceeds 70% of the current EDNS0
+	// limit. This indicates the path can reliably deliver > current size.
+	threshold := cur * 70 / 100
+	if largest < threshold {
+		return
+	}
+	log.Printf("EDNS0 probe: promoting %d → %d (observed max response: %d bytes)", cur, nextStep, largest)
+	c.currentEDNS0.Store(nextStep)
+	// Reset so we re-evaluate fresh at the new level.
+	c.largestResp.Store(0)
+}
+
+// ClientID returns the client's turbotunnel ClientID.
+func (c *DNSPacketConn) ClientID() turbotunnel.ClientID {
+	return c.clientID
+}
+
+// Domain returns the tunnel domain.
+func (c *DNSPacketConn) Domain() dns.Name {
+	return c.domain
+}
+
+// NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
+// and ReadFrom methods, handles the actual sending and receiving the DNS
+// messages encoded by DNSPacketConn. addr is the address to be passed to
+// transport.WriteTo whenever a message needs to be sent.
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
+	// Generate a new random ClientID.
+	clientID := turbotunnel.NewClientID()
+	c := &DNSPacketConn{
+		clientID:        clientID,
+		domain:          domain,
+		pollChan:        make(chan struct{}, pollLimit),
+		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	go func() {
+		err := c.recvLoop(transport)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+	go func() {
+		err := c.sendLoop(transport, addr)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("sendLoop: %v", err)
+		}
+	}()
+	return c
+}
+
+// NewDNSPacketConnWithConfig is like NewDNSPacketConn but accepts a
+// DNSPacketConnConfig to override defaults. A nil config is equivalent to the
+// zero-value config (all defaults).
+func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig) *DNSPacketConn {
+	pl := pollLimit
+	var cfgInit, cfgMax time.Duration
+	var edns0 int
+	var pollJitter, burstMode, probeEDNS0, coverQueries bool
+	if config != nil {
+		if config.PollLimit > 0 {
+			pl = config.PollLimit
+		}
+		cfgInit = config.InitPollDelay
+		cfgMax = config.MaxPollDelay
+		edns0 = config.EDNS0Size
+		pollJitter = config.PollJitter
+		burstMode = config.BurstMode
+		probeEDNS0 = config.ProbeEDNS0
+		coverQueries = config.CoverQueries
+	}
+	clientID := turbotunnel.NewClientID()
+	c := &DNSPacketConn{
+		clientID:         clientID,
+		domain:           domain,
+		pollChan:         make(chan struct{}, pl),
+		cfgInitPollDelay: cfgInit,
+		cfgMaxPollDelay:  cfgMax,
+		edns0Size:        edns0,
+		pollJitter:       pollJitter,
+		burstMode:        burstMode,
+		probeEDNS0:       probeEDNS0,
+		coverQueries:     coverQueries,
+		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	// Seed the adaptive EDNS0 starting point.
+	if probeEDNS0 {
+		start := uint32(edns0)
+		if start < 512 {
+			start = 512
+		}
+		c.currentEDNS0.Store(start)
+	}
+	go func() {
+		err := c.recvLoop(transport)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+	go func() {
+		err := c.sendLoop(transport, addr)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("sendLoop: %v", err)
+		}
+	}()
+	return c
+}
+
+// NewDNSPacketConnWithHooks is like NewDNSPacketConnWithConfig but also accepts
+// DNSPacketConnHooks for pluggable send behavior. This allows external modules
+// to inject custom encoding, jitter, and cover traffic without
+// modifying the core send loop.
+func NewDNSPacketConnWithHooks(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig, hooks *DNSPacketConnHooks) *DNSPacketConn {
+	pl := pollLimit
+	var cfgInit, cfgMax time.Duration
+	var edns0 int
+	var pollJitter, burstMode, probeEDNS0, coverQueries bool
+	if config != nil {
+		if config.PollLimit > 0 {
+			pl = config.PollLimit
+		}
+		cfgInit = config.InitPollDelay
+		cfgMax = config.MaxPollDelay
+		edns0 = config.EDNS0Size
+		pollJitter = config.PollJitter
+		burstMode = config.BurstMode
+		probeEDNS0 = config.ProbeEDNS0
+		coverQueries = config.CoverQueries
+	}
+
+	var clientID turbotunnel.ClientID
+	if hooks != nil && hooks.ClientID != nil {
+		clientID = *hooks.ClientID
+	} else {
+		clientID = turbotunnel.NewClientID()
+	}
+
+	c := &DNSPacketConn{
+		clientID:         clientID,
+		domain:           domain,
+		pollChan:         make(chan struct{}, pl),
+		cfgInitPollDelay: cfgInit,
+		cfgMaxPollDelay:  cfgMax,
+		edns0Size:        edns0,
+		pollJitter:       pollJitter,
+		burstMode:        burstMode,
+		probeEDNS0:       probeEDNS0,
+		coverQueries:     coverQueries,
+		hooks:            hooks,
+		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	if probeEDNS0 {
+		start := uint32(edns0)
+		if start < 512 {
+			start = 512
+		}
+		c.currentEDNS0.Store(start)
+	}
+	go func() {
+		err := c.recvLoop(transport)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+	go func() {
+		err := c.sendLoop(transport, addr)
+		if err != nil && !isClosedConnError(err) {
+			log.Printf("sendLoop: %v", err)
+		}
+	}()
+	return c
+}
+
+// dnsResponsePayload extracts the downstream payload of a DNS response, encoded
+// into the RDATA of a TXT RR. It returns nil if the message doesn't pass format
+// checks, or if the name in its Question entry is not a subdomain of domain.
+func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
+	if resp.Flags&0x8000 != 0x8000 {
+		// QR != 1, this is not a response.
+		return nil
+	}
+	if resp.Flags&0x000f != dns.RcodeNoError {
+		return nil
+	}
+
+	if len(resp.Answer) == 0 {
+		return nil
+	}
+	answer := resp.Answer[0]
+
+	_, ok := answer.Name.TrimSuffix(domain)
+	if !ok {
+		// Not the name we are expecting.
+		return nil
+	}
+
+	if answer.Type != dns.RRTypeTXT {
+		return nil
+	}
+	if len(resp.Answer) != 1 {
+		return nil
+	}
+	payload, err := dns.DecodeRDataTXT(answer.Data)
+	if err != nil {
+		return nil
+	}
+	return payload
+}
+
+// nextPacket reads the next length-prefixed packet from r. It returns a nil
+// error only when a complete packet was read. It returns io.EOF only when there
+// were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF when
+// EOF occurs in the middle of an encoded packet.
+func nextPacket(r *bytes.Reader) ([]byte, error) {
+	for {
+		var n uint16
+		err := binary.Read(r, binary.BigEndian, &n)
+		if err != nil {
+			// We may return a real io.EOF only here.
+			return nil, err
+		}
+		p := make([]byte, n)
+		_, err = io.ReadFull(r, p)
+		// Here we must change io.EOF to io.ErrUnexpectedEOF.
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return p, err
+	}
+}
+
+// recvLoop repeatedly calls transport.ReadFrom to receive a DNS message,
+// extracts its payload and breaks it into packets, and stores the packets in a
+// queue to be returned from a future call to c.ReadFrom.
+//
+// Whenever we receive a DNS response containing at least one data packet, we
+// send on c.pollChan to permit sendLoop to send an immediate polling queries.
+// KCP itself will also send an ACK packet for incoming data, which is
+// effectively a second poll. Therefore, each time we receive data, we send up
+// to 2 polling queries (or 1 + f polling queries, if KCP only ACKs an f
+// fraction of incoming data). We say "up to" because sendLoop will discard an
+// empty polling query if it has an organic non-empty packet to send (this goes
+// also for KCP's organic ACK packets).
+//
+// The intuition behind polling immediately after receiving is that if server
+// has just had something to send, it may have more to send, and in order for
+// the server to send anything, we must give it a query to respond to. The
+// intuition behind polling *2 times* (or 1 + f times) is similar to TCP slow
+// start: we want to maintain some number of queries "in flight", and the faster
+// the server is sending, the higher that number should be. If we polled only
+// once for each received packet, we would tend to have only one query in flight
+// at a time, ping-pong style. The first polling query replaces the in-flight
+// query that has just finished its duty in returning data to us; the second
+// grows the effective in-flight window proportional to the rate at which
+// data-carrying responses are being received. Compare to Eq. (2) of
+// https://tools.ietf.org/html/rfc5681#section-3.1. The differences are that we
+// count messages, not bytes, and we don't maintain an explicit window. If a
+// response comes back without data, or if a query or response is dropped by the
+// network, then we don't poll again, which decreases the effective in-flight
+// window.
+func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
+	for {
+		var buf [4096]byte
+		n, addr, err := transport.ReadFrom(buf[:])
+		if err != nil {
+			//goland:noinspection GoDeprecation
+			if err, ok := err.(net.Error); ok && err.Temporary() {
+				log.Printf("ReadFrom temporary error: %v", err)
+				continue
+			}
+			return err
+		}
+
+		// Track largest raw DNS response for adaptive EDNS0 probing.
+		if c.probeEDNS0 && n > 0 {
+			if uint32(n) > c.largestResp.Load() {
+				c.largestResp.Store(uint32(n))
+			}
+		}
+		// Update global metrics.
+		Metrics.QueriesRecv.Add(1)
+		Metrics.BytesRecv.Add(uint64(n))
+
+		// Got a response. Try to parse it as a DNS message.
+		resp, err := dns.MessageFromWireFormat(buf[:n])
+		if err != nil {
+			log.Printf("MessageFromWireFormat: %v", err)
+			continue
+		}
+
+		payload := dnsResponsePayload(&resp, c.domain)
+
+		// Pull out the packets contained in the payload.
+		r := bytes.NewReader(payload)
+		anyPacket := false
+		for {
+			p, err := nextPacket(r)
+			if err != nil {
+				break
+			}
+			anyPacket = true
+			c.QueuePacketConn.QueueIncoming(p, addr)
+		}
+
+		// If the payload contained one or more packets, permit sendLoop
+		// to poll immediately. ACKs on received data will effectively
+		// serve as another stream of polls whose rate is proportional
+		// to the rate of incoming packets.
+		if anyPacket {
+			select {
+			case c.pollChan <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// chunks breaks p into non-empty subslices of at most n bytes, greedily so that
+// only final subslice has length < n.
+func chunks(p []byte, n int) [][]byte {
+	var result [][]byte
+	for len(p) > 0 {
+		sz := len(p)
+		if sz > n {
+			sz = n
+		}
+		result = append(result, p[:sz])
+		p = p[sz:]
+	}
+	return result
+}
+
+// send sends p as a single packet encoded into a DNS query, using
+// transport.WriteTo(query, addr). The length of p must be less than 224 bytes.
+//
+// Here is an example of how a packet is encoded into a DNS name, using
+//
+//	p = "supercalifragilisticexpialidocious"
+//	c.clientID = "CLIENTID"
+//	domain = "t.example.com"
+//
+// as the input.
+//
+//  0. Start with the raw packet contents.
+//
+//	supercalifragilisticexpialidocious
+//
+//  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
+//     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
+//     of L − 0xe0 bytes (not counting the length of the length prefix itself).
+//
+//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//
+//  2. Prefix the ClientID.
+//
+//	CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//
+//  3. Base32-encode, without padding and in lower case.
+//
+//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
+//
+//  4. Break into labels of at most 63 octets.
+//
+//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
+//
+//  5. Append the domain.
+//
+//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
+	isPoll := len(p) == 0
+
+	var decoded []byte
+	{
+		if len(p) >= 224 {
+			return fmt.Errorf("too long")
+		}
+		var buf bytes.Buffer
+		// ClientID
+		buf.Write(c.clientID[:])
+
+		var n int
+		if isPoll {
+			// Variable poll padding: randomise length in [pollPaddingMin,
+			// pollPaddingMax] so each idle poll produces a unique QNAME
+			// length. A fixed-length poll is easy for DPI to fingerprint.
+			var rb [1]byte
+			_, _ = rand.Read(rb[:])
+			span := pollPaddingMax - pollPaddingMin + 1
+			n = pollPaddingMin + int(rb[0])%span
+		} else {
+			n = numPadding
+		}
+		// Padding / cache inhibition
+		buf.WriteByte(byte(224 + n))
+		_, _ = io.CopyN(&buf, rand.Reader, int64(n))
+		// Packet contents
+		if !isPoll {
+			buf.WriteByte(byte(len(p)))
+			buf.Write(p)
+		}
+		decoded = buf.Bytes()
+	}
+
+	encoded := make([]byte, base32Encoding.EncodedLen(len(decoded)))
+	base32Encoding.Encode(encoded, decoded)
+	encoded = bytes.ToLower(encoded)
+	labels := chunks(encoded, 63)
+	labels = append(labels, c.domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return err
+	}
+
+	// Cover query type: for ~15% of idle polls, use type A or AAAA instead
+	// of TXT. The server decodes the QNAME correctly and routes any upstream
+	// data, but returns an empty (non-TXT) response. The effect is that a DPI
+	// watching the stream sees a natural mix of A and TXT queries rather than
+	// 100% TXT, which is the primary DNS-tunnel traffic fingerprint.
+	// Never applied to data-carrying queries (only polls).
+	var qtype uint16 = dns.RRTypeTXT
+	if isPoll && c.coverQueries {
+		var rb [1]byte
+		_, _ = rand.Read(rb[:])
+		if rb[0] < 38 { // 38/256 ≈ 15%
+			if rb[0]&1 == 0 {
+				qtype = dns.RRTypeA
+			} else {
+				qtype = dns.RRTypeAAAA
+			}
+		}
+	}
+
+	var id uint16
+	_ = binary.Read(rand.Reader, binary.BigEndian, &id)
+	query := &dns.Message{
+		ID:    id,
+		Flags: 0x0100, // QR = 0, RD = 1
+		Question: []dns.Question{
+			{
+				Name:  name,
+				Type:  qtype,
+				Class: dns.ClassIN,
+			},
+		},
+		// EDNS(0)
+		Additional: []dns.RR{
+			{
+				Name:  dns.Name{},
+				Type:  dns.RRTypeOPT,
+				Class: c.edns0Class(), // requester's UDP payload size
+				TTL:   0,              // extended RCODE and flags
+				Data:  []byte{},
+			},
+		},
+	}
+	buf, err := query.WireFormat()
+	if err != nil {
+		return err
+	}
+
+	_, err = transport.WriteTo(buf, addr)
+	return err
+}
+
+// jitter adds ±30% random variation to a duration, making poll intervals
+// non-deterministic. This prevents DPI from fingerprinting the exponential
+// backoff pattern.
+func jitter(d time.Duration) time.Duration {
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	// Scale to 0.7–1.3× the base duration.
+	frac := 0.7 + 0.6*float64(binary.BigEndian.Uint16(b[:]))/65535.0
+	return time.Duration(float64(d) * frac)
+}
+
+// isClosedConnError reports whether err is a "use of closed network connection"
+// error, which is expected during graceful shutdown.
+func isClosedConnError(err error) bool {
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") || strings.Contains(err.Error(), "closed connection")
+}
+
+// sendLoop takes packets that have been written using c.WriteTo, and sends them
+// on the network using send. It also does polling with empty packets when
+// requested by pollChan or after a timeout.
+func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
+	// Fire OnStart hook (e.g., to launch cover traffic).
+	if c.hooks != nil && c.hooks.OnStart != nil {
+		c.hooks.OnStart(transport, addr)
+	}
+
+	iPollDelay := initPollDelay
+	if c.cfgInitPollDelay > 0 {
+		iPollDelay = c.cfgInitPollDelay
+	}
+	mPollDelay := maxPollDelay
+	if c.cfgMaxPollDelay > 0 {
+		mPollDelay = c.cfgMaxPollDelay
+	}
+
+	applyJitter := func(d time.Duration) time.Duration {
+		if c.pollJitter {
+			return jitter(d)
+		}
+		return d
+	}
+
+	// Burst mode state: idle polls are grouped into small bursts
+	// (2-5 queries ~150ms apart) separated by silences (2-8s),
+	// mimicking page-load → reading → page-load DNS patterns.
+	var burstRemaining int
+
+	pollDelay := iPollDelay
+	pollTimer := time.NewTimer(applyJitter(pollDelay))
+	for {
+		var p []byte
+		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
+		pollTimerExpired := false
+		// Prioritize sending an actual data packet from outgoing. Only
+		// consider a poll when outgoing is empty.
+		select {
+		case p = <-outgoing:
+		default:
+			select {
+			case p = <-outgoing:
+			case <-c.pollChan:
+			case <-pollTimer.C:
+				pollTimerExpired = true
+			}
+		}
+
+		if len(p) > 0 {
+			// A data-carrying packet displaces one pending poll
+			// opportunity, if any.
+			select {
+			case <-c.pollChan:
+			default:
+			}
+		}
+
+		if pollTimerExpired {
+			if c.burstMode {
+				// Burst mode: group idle polls into bursts with
+				// silences between them.
+				if burstRemaining > 0 {
+					// Inside a burst: short delay between polls.
+					pollDelay = 120*time.Millisecond + jitter(80*time.Millisecond)
+					burstRemaining--
+				} else {
+					// Burst finished: silence, then start a new burst.
+					// Silence: 2-8s (mimics user reading a page).
+					pollDelay = 2*time.Second + jitter(3*time.Second)
+					// Next burst: 2-5 polls.
+					var b [1]byte
+					_, _ = rand.Read(b[:])
+					burstRemaining = 2 + int(b[0])%4
+				}
+			} else {
+				// Standard: exponential backoff.
+				pollDelay = time.Duration(float64(pollDelay) * pollDelayMultiplier)
+				if pollDelay > mPollDelay {
+					pollDelay = mPollDelay
+				}
+			}
+		} else {
+			// We're sending an actual data packet, or we're polling
+			// in response to a received packet. Reset the poll
+			// delay to initial.
+			if !pollTimer.Stop() {
+				<-pollTimer.C
+			}
+			pollDelay = iPollDelay
+			burstRemaining = 0
+		}
+		pollTimer.Reset(applyJitter(pollDelay))
+
+		// PreSendHook (e.g., jitter) runs before each send.
+		if c.hooks != nil && c.hooks.PreSendHook != nil {
+			c.hooks.PreSendHook()
+		}
+
+		// Unlike in the server, in the client we assume that because
+		// the data capacity of queries is so limited, it's not worth
+		// trying to send more than one packet per query.
+		var err error
+		if c.hooks != nil && c.hooks.CustomSendFunc != nil {
+			err = c.hooks.CustomSendFunc(transport, p, addr)
+		} else {
+			err = c.send(transport, p, addr)
+		}
+		if err != nil {
+			// Stop the loop if the transport has been closed.
+			if isClosedConnError(err) {
+				return err
+			}
+			log.Printf("send: %v", err)
+			continue
+		}
+
+		// Update global metrics.
+		Metrics.QueriesSent.Add(1)
+		// Reflect current EDNS0 in the metrics snapshot.
+		if c.probeEDNS0 {
+			if v := c.currentEDNS0.Load(); v > 0 {
+				Metrics.CurrentEDNS0.Store(v)
+			}
+		} else {
+			Metrics.CurrentEDNS0.Store(uint32(c.edns0Class()))
+		}
+
+		// Adaptive EDNS0 probing: every 30 successful sends, check
+		// whether the path can sustain a larger EDNS0 payload size.
+		if c.probeEDNS0 {
+			if c.sendCount.Add(1)%30 == 0 {
+				c.tryPromoteEDNS0(transport)
+			}
+		}
+	}
+}
